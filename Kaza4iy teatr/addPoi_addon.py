@@ -7,16 +7,39 @@ from bpy_extras import view3d_utils
 bl_info = {
     "name": "POI Manager Pro",
     "author": "Сивов Иван",
-    "version": (2, 2),  
+    "version": (2, 3),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > POI",
     "description": "Менеджер точек интереса для театральных моделей с экспортом JSON/CSV/TXT",
     "category": "3D View",
 }
 
+POI_COLLECTION_NAME = "POI"
+
+
+def get_or_create_poi_collection():
+    """Возвращает коллекцию POI, создавая её при необходимости."""
+    col = bpy.data.collections.get(POI_COLLECTION_NAME)
+    if col is None:
+        col = bpy.data.collections.new(POI_COLLECTION_NAME)
+        bpy.context.scene.collection.children.link(col)
+    return col
+
+
 def get_poi_objects():
-    """Возвращает список всех объектов-POI в сцене"""
+    """Возвращает список всех объектов-POI в сцене."""
     return [obj for obj in bpy.data.objects if "is_poi" in obj]
+
+
+def link_to_poi_collection(obj):
+    """Помещает объект в коллекцию POI, убирая из всех остальных коллекций."""
+    poi_col = get_or_create_poi_collection()
+        
+    for col in list(obj.users_collection):
+        col.objects.unlink(obj)
+
+    poi_col.objects.link(obj)
+
 
 class POI_OT_InteractivePlace(bpy.types.Operator):
     """Интерактивное размещение точки кликом"""
@@ -44,12 +67,11 @@ class POI_OT_InteractivePlace(bpy.types.Operator):
                 empty.empty_display_type = 'SPHERE'
                 empty.empty_display_size = 0.15
                 empty.location = loc
-
-                context.scene.collection.objects.link(empty)
-
                 empty["is_poi"] = True
                 empty.poi_type = poi_type
                 empty.show_in_front = True
+
+                link_to_poi_collection(empty)
 
                 context.area.tag_redraw()
                 return {'FINISHED'}
@@ -141,9 +163,10 @@ class POI_OT_Import(bpy.types.Operator):
                 empty.empty_display_type = 'SPHERE'
                 empty.empty_display_size = 0.15
                 empty.location = item['loc']
-                context.scene.collection.objects.link(empty)
                 empty["is_poi"] = True
                 empty.poi_type = item['type']
+
+                link_to_poi_collection(empty)
 
         return {'FINISHED'}
 
@@ -175,7 +198,6 @@ class POI_OT_AutoGenerate(bpy.types.Operator):
     )
 
     def execute(self, context):
-        # 1. Только видимые mesh-объекты без метки POI
         mesh_objects = [
             obj for obj in context.scene.objects
             if obj.type == 'MESH' and "is_poi" not in obj and obj.visible_get()
@@ -189,32 +211,22 @@ class POI_OT_AutoGenerate(bpy.types.Operator):
             d = o.dimensions
             return d[0] * d[1] * d[2]
 
-        # 2. Главное здание — самое большое по габаритному объёму
         mesh_objects.sort(key=get_volume, reverse=True)
         main_building = mesh_objects[0]
-        main_mesh_name = main_building.data.name  # запомним, чтобы исключить ниже
+        main_mesh_name = main_building.data.name
 
-        self.create_poi(
-            context, main_building,
-            "Главное здание", 'INFO', 1, main_mesh_name
-        )
+        self.create_poi(context, main_building, "Главное здание", 'INFO', 1, main_mesh_name)
 
-        # 3. Фильтрация и группировка по имени исходного меша
         groups = {}
         for obj in mesh_objects[1:]:
-            # ИСПРАВЛЕНО: пропускаем меш главного здания, чтобы не дублировать POI
             if obj.data.name == main_mesh_name:
                 continue
-
             if get_volume(obj) < self.min_volume:
                 continue
-
-            # ИСПРАВЛЕНО: безопасное получение числа полигонов
             try:
                 poly_count = len(obj.data.polygons)
             except Exception:
                 continue
-
             if poly_count < self.min_polygons:
                 continue
 
@@ -223,14 +235,12 @@ class POI_OT_AutoGenerate(bpy.types.Operator):
                 groups[mesh_name] = {"objects": [], "poly_count": poly_count}
             groups[mesh_name]["objects"].append(obj)
 
-        # 4. Сортировка по «индексу важности»: количество экземпляров × полигоны
         sorted_groups = sorted(
             groups.items(),
             key=lambda item: len(item[1]["objects"]) * item[1]["poly_count"],
             reverse=True,
         )
 
-        # 5. Генерируем точки для Топ-N групп
         created_count = 0
         for mesh_name, data in sorted_groups[: self.max_pois]:
             objects = data["objects"]
@@ -251,22 +261,18 @@ class POI_OT_AutoGenerate(bpy.types.Operator):
         return {'FINISHED'}
 
     def create_poi(self, context, target_obj, name, poi_type, count, target_mesh_name):
-        """Вспомогательная функция для создания точки"""
-        # ИСПРАВЛЕНО: создаём Empty напрямую через bpy.data, без ops.
-        # ops.object.select_all/empty_add требуют контекст VIEW_3D,
-        # которого у фонового оператора нет → RuntimeError: context is incorrect
+        """Вспомогательная функция для создания точки."""
         empty = bpy.data.objects.new(name, None)
         empty.empty_display_type = 'SPHERE'
         empty.empty_display_size = 0.3
         empty.location = target_obj.location.copy()
-
-        context.scene.collection.objects.link(empty)
-
         empty["is_poi"] = True
         empty.poi_type = poi_type
         empty.show_in_front = True
         empty["instance_count"] = count
         empty["target_mesh"] = target_mesh_name
+
+        link_to_poi_collection(empty)
 
 
 class POI_OT_SelectIdentical(bpy.types.Operator):
@@ -277,7 +283,6 @@ class POI_OT_SelectIdentical(bpy.types.Operator):
     target_mesh: bpy.props.StringProperty()
 
     def execute(self, context):
-        # Снимаем выделение напрямую, без ops
         for obj in context.scene.objects:
             obj.select_set(False)
 
@@ -315,7 +320,6 @@ class POI_UL_List(bpy.types.UIList):
 
     def filter_items(self, context, data, propname):
         objects = getattr(data, propname)
-
         flt_flags = [self.bitflag_filter_item if "is_poi" in obj else 0 for obj in objects]
 
         if self.filter_name:
@@ -362,7 +366,6 @@ class POI_PT_MainPanel(bpy.types.Panel):
         row.operator("poi.export", text="TXT").format = 'TXT'
 
         layout.operator("poi.import_json", icon='IMPORT')
-
 
 classes = [
     POI_OT_InteractivePlace,
